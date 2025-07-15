@@ -1,0 +1,751 @@
+-- Package to define shared types
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+-- This package defines a shared data type for an LCD line, making it easy 
+-- to pass display data between modules.
+package lcd_pkg is
+    type T_LCD_LINE is array (0 to 15) of std_logic_vector(7 downto 0);
+end package lcd_pkg;
+
+-- =============================================================================
+-- == MODULE 1: RESET HANDLER
+-- =============================================================================
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+-- This entity handles an asynchronous reset input (e.g., from a pushbutton)
+-- and converts it to a synchronous reset signal to prevent metastability.
+entity reset_handler is
+    Port ( 
+        clk        : in  STD_LOGIC;         -- System clock
+        async_rst  : in  STD_LOGIC;         -- Asynchronous reset input
+        sync_rst   : out STD_LOGIC          -- Synchronous reset output
+    );
+end reset_handler;
+
+architecture Behavioral of reset_handler is
+    -- Internal signal for the 2-flip-flop synchronizer chain.
+    signal rst_sync : STD_LOGIC_VECTOR(1 downto 0);
+begin
+    -- Process to synchronize the reset signal with the main clock.
+    process(clk) 
+    begin 
+        if rising_edge(clk) then 
+            rst_sync(0) <= async_rst;
+            rst_sync(1) <= rst_sync(0);
+        end if; 
+    end process;
+    
+    -- Output the synchronized reset signal.
+    sync_rst <= rst_sync(1);
+end Behavioral;
+
+-- =============================================================================
+-- == MODULE 2: PS/2 CONTROLLER 
+-- =============================================================================
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+-- This entity interfaces with a PS/2 keyboard, captures raw scancodes,
+-- and converts them to ASCII characters.
+entity ps2_keyboard is
+    port (
+        clk        : in  STD_LOGIC;         -- System clock
+        ps2_clk    : in  STD_LOGIC;         -- PS/2 clock line (from keyboard)
+        ps2_data   : in  STD_LOGIC;         -- PS/2 data line (from keyboard)
+        ascii_out  : out STD_LOGIC_VECTOR(7 downto 0); -- ASCII output of the pressed key
+        data_ready : out STD_LOGIC          -- A pulse indicating new data is available
+    );
+end ps2_keyboard;
+
+architecture Behavioral of ps2_keyboard is
+    -- State machine to handle PS/2 communication logic.
+    -- IDLE: waiting for a key press.
+    -- GOT_F0: a break code (key release) was detected, ignore next code.
+    -- GOT_CODE: a make code (key press) was detected, process it.
+    type T_PS2_STATE is (IDLE, GOT_F0, GOT_CODE);
+    signal state : T_PS2_STATE := IDLE;
+    
+    -- Buffer to store the 11-bit serial frame from the keyboard.
+    signal ps2_serial_buffer : STD_LOGIC_VECTOR(10 downto 0) := (others => '0');
+    -- Buffer to hold the extracted 8-bit scancode.
+    signal scancode          : STD_LOGIC_VECTOR(7 downto 0)  := (others => '0');
+    -- Counter for the incoming serial bits.
+    signal bit_count         : integer range 0 to 11 := 0;
+
+    -- Signals for synchronizing the PS/2 clock and detecting its falling edge.
+    signal ps2_clk_s1, ps2_clk_s2, ps2_clk_s3 : std_logic := '1';
+    signal ps2_clk_fall                      : std_logic := '0';
+
+    -- A lookup table (ROM) to map relevant scancodes to ASCII values.
+    type scancode_map_type is array (0 to 255) of STD_LOGIC_VECTOR(7 downto 0);
+    constant scancode_to_ascii : scancode_map_type := (
+        -- Numbers
+        22 => X"31", 30 => X"32", 38 => X"33", 37 => X"34", 46 => X"35", 
+        54 => X"36", 61 => X"37", 62 => X"38", 70 => X"39", 69 => X"30",
+        -- Operators (Keypad)
+        124 => X"2A", -- *
+        123 => X"2D", -- -
+        121 => X"2B", -- +
+        74  => X"2F", -- /
+        -- Enter (Keypad and main)
+        90  => X"0D", -- Enter
+        113 => X"0D", -- Enter (Keypad)
+        -- Default for unmapped keys
+        others => X"00"
+    );
+
+begin
+    -- Synchronization and Edge Detection Process
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            -- 3-stage synchronizer chain for the PS/2 clock to prevent metastability.
+            ps2_clk_s1 <= ps2_clk;
+            ps2_clk_s2 <= ps2_clk_s1;
+            ps2_clk_s3 <= ps2_clk_s2;
+
+            -- Detect the falling edge of the synchronized PS/2 clock.
+            -- Data should be sampled on this edge.
+            if ps2_clk_s3 = '0' and ps2_clk_s2 = '1' then
+                ps2_clk_fall <= '1';
+            else
+                ps2_clk_fall <= '0';
+            end if;
+        end if;
+    end process;
+
+    -- Main State Machine Logic Process
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            -- data_ready is a single-cycle pulse.
+            data_ready <= '0';
+
+            -- A falling edge was detected, sample the data.
+            if ps2_clk_fall = '1' then
+
+                ps2_serial_buffer(bit_count) <= ps2_data;
+
+                if bit_count < 10 then
+                    bit_count <= bit_count + 1;
+                else -- Full frame received (1 start, 8 data, 1 parity, 1 stop)
+                    scancode  <= ps2_serial_buffer(8 downto 1);
+                    bit_count <= 0;
+                    
+                    -- FSM logic to handle make/break codes.
+                    case state is
+                        when IDLE =>
+                            -- If it's a break code (F0), wait for the next scancode to ignore it.
+                            if ps2_serial_buffer(8 downto 1) = X"F0" then
+                                state <= GOT_F0;
+                            -- If it's a make code, process it.
+                            else
+                                state <= GOT_CODE;
+                            end if;
+                        when GOT_F0 => state <= IDLE; -- Ignore the key code after F0.
+                        when GOT_CODE => state <= IDLE; -- Return to idle after processing.
+                    end case;
+                end if;
+                
+            -- This block executes after a full scancode has been received and identified as a make code.
+            elsif state = GOT_CODE then
+                -- Check if the received scancode is in our map.
+                if scancode_to_ascii(to_integer(unsigned(scancode))) /= X"00" then
+                    -- If so, output the corresponding ASCII value and pulse data_ready.
+                    ascii_out  <= scancode_to_ascii(to_integer(unsigned(scancode)));
+                    data_ready <= '1';
+                end if;
+                -- Return to idle state after processing.
+                state <= IDLE;
+            end if;
+        end if;
+    end process;
+end Behavioral;
+
+-- =============================================================================
+-- == HARDWARE MODULES (Converter, Divider, Logic, LCD)
+-- =============================================================================
+
+-- Integer to ASCII Converter
+library IEEE; use IEEE.STD_LOGIC_1164.ALL; use IEEE.NUMERIC_STD.ALL;
+
+-- This entity converts a binary integer into four ASCII digits using the
+-- "Double Dabble" (or Shift-and-Add-3) algorithm for binary-to-BCD conversion.
+entity int_to_ascii_converter is 
+    Port (
+        clk      : in  STD_LOGIC;
+        rst      : in  STD_LOGIC;
+        num_in   : in  integer range -9999 to 9999; -- Binary number to convert
+        start    : in  STD_LOGIC;                   -- Starts the conversion
+        ascii_d0 : out STD_LOGIC_VECTOR(7 downto 0); -- ASCII ones digit
+        ascii_d1 : out STD_LOGIC_VECTOR(7 downto 0); -- ASCII tens digit
+        ascii_d2 : out STD_LOGIC_VECTOR(7 downto 0); -- ASCII hundreds digit
+        ascii_d3 : out STD_LOGIC_VECTOR(7 downto 0); -- ASCII thousands digit
+        done     : out STD_LOGIC                    -- Pulse indicating conversion is finished
+    );
+end int_to_ascii_converter;
+
+architecture Behavioral of int_to_ascii_converter is
+    -- FSM for the conversion process.
+    type T_CONV_STATE is (S_IDLE, S_LOAD, S_CHECK_ADD, S_SHIFT, S_FINISH);
+    signal state : T_CONV_STATE := S_IDLE;
+    
+    -- Registers for the algorithm.
+    signal binary_val     : unsigned(13 downto 0);
+    signal bcd_units, bcd_tens, bcd_hundreds, bcd_thousands : unsigned(3 downto 0);
+    signal shift_count    : integer range 0 to 14;
+
+begin
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst = '1' then
+                state <= S_IDLE;
+                done <= '0';
+            else
+                done <= '0';
+                case state is
+                    when S_IDLE =>
+                        if start = '1' then
+                            state <= S_LOAD;
+                        end if;
+                    when S_LOAD =>
+                        -- Load the absolute value of the input number and reset BCD registers.
+                        binary_val <= to_unsigned(abs(num_in), 14);
+                        bcd_units <= (others => '0');
+                        bcd_tens <= (others => '0');
+                        bcd_hundreds <= (others => '0');
+                        bcd_thousands <= (others => '0');
+                        shift_count <= 0;
+                        state <= S_CHECK_ADD;
+                    when S_CHECK_ADD =>
+                        -- "Add 3" step: If any BCD digit is > 4, add 3 before shifting.
+                        if bcd_units > 4 then bcd_units <= bcd_units + 3; end if;
+                        if bcd_tens > 4 then bcd_tens <= bcd_tens + 3; end if;
+                        if bcd_hundreds > 4 then bcd_hundreds <= bcd_hundreds + 3; end if;
+                        if bcd_thousands > 4 then bcd_thousands <= bcd_thousands + 3; end if;
+                        state <= S_SHIFT;
+                    when S_SHIFT =>
+                        -- "Shift" step: Shift the entire binary-BCD register left by one bit.
+                        bcd_thousands <= bcd_thousands(2 downto 0) & bcd_hundreds(3);
+                        bcd_hundreds  <= bcd_hundreds(2 downto 0) & bcd_tens(3);
+                        bcd_tens <= bcd_tens(2 downto 0) & bcd_units(3);
+                        bcd_units <= bcd_units(2 downto 0) & binary_val(13);
+                        binary_val <= binary_val(12 downto 0) & '0';
+                        
+                        -- Repeat for 14 shifts (for a 14-bit number).
+                        if shift_count = 13 then
+                            state <= S_FINISH;
+                        else
+                            shift_count <= shift_count + 1;
+                            state <= S_CHECK_ADD;
+                        end if;
+                    when S_FINISH =>
+                        -- Convert BCD digits to ASCII ('0' = x30) and signal completion.
+                        ascii_d3 <= "0011" & std_logic_vector(bcd_thousands);
+                        ascii_d2 <= "0011" & std_logic_vector(bcd_hundreds);
+                        ascii_d1 <= "0011" & std_logic_vector(bcd_tens);
+                        ascii_d0 <= "0011" & std_logic_vector(bcd_units);
+                        done <= '1';
+                        state <= S_IDLE;
+                end case;
+            end if;
+        end if;
+    end process;
+end Behavioral;
+
+-- Integer Divider
+library IEEE; use IEEE.STD_LOGIC_1164.ALL; use IEEE.NUMERIC_STD.ALL;
+
+-- This entity performs integer division using the method of
+-- successive subtraction.
+entity integer_divider is 
+    Port (
+        clk          : in  STD_LOGIC;
+        rst          : in  STD_LOGIC;
+        start        : in  STD_LOGIC;
+        dividend_in  : in  integer range 0 to 999999;
+        divisor_in   : in  integer range 0 to 999999;
+        quotient_out : out integer range 0 to 999999;
+        done         : out STD_LOGIC;
+        div_by_zero  : out STD_LOGIC
+    );
+end integer_divider;
+
+architecture Behavioral of integer_divider is
+    -- FSM for the division process.
+    type T_DIV_STATE is (S_IDLE, S_LOAD, S_CALC, S_FINISH, S_ERROR);
+    signal state: T_DIV_STATE := S_IDLE;
+    -- Internal registers for calculation.
+    signal remainder, quotient, divisor: integer;
+
+begin
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst = '1' then
+                state <= S_IDLE;
+                done <= '0';
+                div_by_zero <= '0';
+            else
+                done <= '0';
+                div_by_zero <= '0';
+                case state is
+                    when S_IDLE =>
+                        if start = '1' then state <= S_LOAD; end if;
+                    when S_LOAD =>
+                        -- Check for division by zero.
+                        if divisor_in = 0 then
+                            state <= S_ERROR;
+                        else
+                            -- Load initial values.
+                            remainder <= dividend_in;
+                            divisor <= divisor_in;
+                            quotient <= 0;
+                            state <= S_CALC;
+                        end if;
+                    when S_CALC =>
+                        -- Repeatedly subtract divisor from remainder.
+                        if remainder >= divisor then
+                            remainder <= remainder - divisor;
+                            quotient <= quotient + 1;
+                        else
+                            -- Division is complete when remainder is less than divisor.
+                            state <= S_FINISH;
+                        end if;
+                    when S_FINISH =>
+                        -- Output the result and signal completion.
+                        quotient_out <= quotient;
+                        done <= '1';
+                        state <= S_IDLE;
+                    when S_ERROR =>
+                        -- Signal a division-by-zero error.
+                        div_by_zero <= '1';
+                        done <= '1';
+                        state <= S_IDLE;
+                end case;
+            end if;
+        end if;
+    end process;
+end Behavioral;
+
+
+-- Calculator Logic
+library IEEE; use IEEE.STD_LOGIC_1164.ALL; use IEEE.NUMERIC_STD.ALL; use work.lcd_pkg.all;
+
+-- This is the main control unit (the "brain") of the calculator. It parses input,
+-- orchestrates calculations, and formats the output for the LCD.
+entity calculator_logic is 
+    Port (
+        clk           : in  STD_LOGIC;
+        rst           : in  STD_LOGIC;
+        -- Inputs from PS/2 Keyboard
+        ascii_in      : in  STD_LOGIC_VECTOR(7 downto 0);
+        data_ready    : in  STD_LOGIC;
+        -- Handshake signals with Int-to-ASCII Converter
+        conv_done     : in  STD_LOGIC;
+        conv_d3       : in  STD_LOGIC_VECTOR(7 downto 0);
+        conv_d2       : in  STD_LOGIC_VECTOR(7 downto 0);
+        conv_d1       : in  STD_LOGIC_VECTOR(7 downto 0);
+        conv_d0       : in  STD_LOGIC_VECTOR(7 downto 0);
+        -- Handshake signals with Integer Divider
+        div_done      : in  STD_LOGIC;
+        div_by_zero   : in  STD_LOGIC;
+        div_quotient  : in  integer range 0 to 999999;
+        -- Outputs to control other modules
+        conv_start    : out STD_LOGIC;
+        conv_num_in   : out integer range -9999 to 9999;
+        div_start     : out STD_LOGIC;
+        div_dividend  : out integer range 0 to 999999;
+        div_divisor   : out integer range 0 to 999999;
+        -- Outputs for display
+        lcd_line1     : out T_LCD_LINE;
+        lcd_line2     : out T_LCD_LINE;
+        led_status    : out STD_LOGIC_VECTOR(3 downto 0)
+    );
+end calculator_logic;
+
+architecture Behavioral of calculator_logic is
+    -- The main FSM for calculator operation.
+    type T_CALC_STATE is (S_IDLE, S_INPUT_OP1, S_INPUT_OP2, S_CALCULATE, S_WAIT_DIVIDE, S_START_CONVERT, S_WAIT_CONVERT, S_DISPLAY_RESULT, S_ERROR);
+    signal state : T_CALC_STATE := S_IDLE;
+    
+    -- Registers to store operands, operator, and result.
+    signal operand1, operand2, result : integer range -9999 to 9999;
+    signal operator : std_logic_vector(7 downto 0);
+    
+    -- Pointer for writing characters to the LCD buffer.
+    signal char_ptr : integer range 0 to 15;
+    -- Buffers for the two lines of the LCD.
+    signal line1_buf, line2_buf : T_LCD_LINE;
+    
+    -- ASCII constants for commonly used characters.
+    constant ASCII_SPACE: std_logic_vector(7 downto 0) := X"20";
+    constant ASCII_MINUS: std_logic_vector(7 downto 0) := X"2D";
+    constant ASCII_ENTER: std_logic_vector(7 downto 0) := X"0D";
+    constant ASCII_PLUS:  std_logic_vector(7 downto 0) := X"2B";
+    constant ASCII_STAR:  std_logic_vector(7 downto 0) := X"2A";
+    constant ASCII_SLASH: std_logic_vector(7 downto 0) := X"2F";
+    constant ASCII_E:     std_logic_vector(7 downto 0) := X"45";
+    constant ASCII_r:     std_logic_vector(7 downto 0) := X"72";
+    constant ASCII_o:     std_logic_vector(7 downto 0) := X"6F";
+
+begin
+    -- Connect internal buffers to the output ports.
+    lcd_line1 <= line1_buf;
+    lcd_line2 <= line2_buf;
+    
+    process(clk)
+        variable digit_val : integer;
+    begin
+        if rising_edge(clk) then
+            if rst = '1' then
+                state <= S_IDLE;
+                conv_start <= '0';
+                div_start <= '0';
+                led_status <= "0000";
+            else
+                -- Default values for control signals.
+                conv_start <= '0';
+                div_start <= '0';
+                
+                case state is
+                    when S_IDLE =>
+                        led_status <= "0000";
+                        -- Clear LCD buffers and reset variables for a new calculation.
+                        line1_buf <= (others => ASCII_SPACE);
+                        line2_buf <= (others => ASCII_SPACE);
+                        operand1 <= 0;
+                        operand2 <= 0;
+                        char_ptr <= 0;
+                        state <= S_INPUT_OP1;
+                        
+                    when S_INPUT_OP1 =>
+                        led_status <= "0001"; -- LED indicates waiting for first operand
+                        if data_ready = '1' then
+                            -- If input is a digit, append it to operand1.
+                            if ascii_in >= X"30" and ascii_in <= X"39" then
+                                if char_ptr < 8 then
+                                    digit_val := to_integer(unsigned(ascii_in)) - 48;
+                                    operand1 <= (operand1 * 10) + digit_val;
+                                    line1_buf(char_ptr) <= ascii_in;
+                                    char_ptr <= char_ptr + 1;
+                                end if;
+                            -- If it's an operator, store it and move to get operand2.
+                            elsif ascii_in = ASCII_PLUS or ascii_in = ASCII_MINUS or ascii_in = ASCII_STAR or ascii_in = ASCII_SLASH then
+                                operator <= ascii_in;
+                                line1_buf(char_ptr) <= ascii_in;
+                                char_ptr <= char_ptr + 1;
+                                state <= S_INPUT_OP2;
+                            end if;
+                        end if;
+
+                    when S_INPUT_OP2 =>
+                        led_status <= "0010"; -- LED indicates waiting for second operand
+                        if data_ready = '1' then
+                            -- If input is a digit, append it to operand2.
+                            if ascii_in >= X"30" and ascii_in <= X"39" then
+                                if char_ptr < 16 then
+                                    digit_val := to_integer(unsigned(ascii_in)) - 48;
+                                    operand2 <= (operand2 * 10) + digit_val;
+                                    line1_buf(char_ptr) <= ascii_in;
+                                    char_ptr <= char_ptr + 1;
+                                end if;
+                            -- If Enter is pressed, start the calculation.
+                            elsif ascii_in = ASCII_ENTER then
+                                state <= S_CALCULATE;
+                            end if;
+                        end if;
+
+                    when S_CALCULATE =>
+                        led_status <= "0100"; -- LED indicates calculating
+                        case operator is
+                            when ASCII_PLUS  => result <= operand1 + operand2; state <= S_START_CONVERT;
+                            when ASCII_MINUS => result <= operand1 - operand2; state <= S_START_CONVERT;
+                            when ASCII_STAR  => result <= operand1 * operand2; state <= S_START_CONVERT;
+                            when ASCII_SLASH => 
+                                -- For division, start the divider module.
+                                div_start <= '1'; 
+                                div_dividend <= operand1; 
+                                div_divisor <= operand2; 
+                                state <= S_WAIT_DIVIDE;
+                            when others => result <= 0; state <= S_START_CONVERT;
+                        end case;
+
+                    when S_WAIT_DIVIDE =>
+                        led_status <= "0100"; -- LED indicates calculating (waiting for divider)
+                        if div_done = '1' then
+                            if div_by_zero = '1' then
+                                state <= S_ERROR;
+                            else
+                                result <= div_quotient;
+                                state <= S_START_CONVERT;
+                            end if;
+                        end if;
+
+                    when S_START_CONVERT =>
+                        led_status <= "0100"; -- LED indicates calculating (converting result)
+                        -- Start the integer-to-ASCII converter.
+                        conv_start <= '1';
+                        conv_num_in <= result;
+                        line2_buf <= (others => ASCII_SPACE);
+                        state <= S_WAIT_CONVERT;
+
+                    when S_WAIT_CONVERT =>
+                        led_status <= "0100"; -- LED indicates calculating (waiting for converter)
+                        if conv_done = '1' then
+                            -- Once conversion is done, load the result into the LCD buffer.
+                            line2_buf(0) <= conv_d3;
+                            line2_buf(1) <= conv_d2;
+                            line2_buf(2) <= conv_d1;
+                            line2_buf(3) <= conv_d0;
+                            if result < 0 then
+                                line2_buf(4) <= ASCII_MINUS;
+                            end if;
+                            state <= S_DISPLAY_RESULT;
+                        end if;
+
+                    when S_DISPLAY_RESULT =>
+                        led_status <= "1000"; -- LED indicates result is displayed
+                        -- Wait for Enter to start a new calculation.
+                        if data_ready = '1' and ascii_in = ASCII_ENTER then
+                            state <= S_IDLE;
+                        end if;
+
+                    when S_ERROR =>
+                        led_status <= "1000"; -- LED indicates an error occurred
+                        -- Display "Erro" on the second line.
+                        line2_buf(0) <= ASCII_E;
+                        line2_buf(1) <= ASCII_r;
+                        line2_buf(2) <= ASCII_r;
+                        line2_buf(3) <= ASCII_o;
+                        state <= S_DISPLAY_RESULT; -- Go to display state to show the error
+                end case;
+            end if;
+        end if;
+    end process;
+end Behavioral;
+
+-- LCD Controller
+library IEEE; use IEEE.STD_LOGIC_1164.ALL; use IEEE.NUMERIC_STD.ALL; use work.lcd_pkg.all;
+
+-- This entity provides low-level control for an HD44780-compatible character LCD.
+-- It handles initialization and continuously refreshes the display from input buffers.
+entity lcd_controller is 
+    Port (
+        clk      : in  STD_LOGIC;
+        rst      : in  STD_LOGIC;
+        line1_in : in  T_LCD_LINE; -- Buffer for the first line of the LCD
+        line2_in : in  T_LCD_LINE; -- Buffer for the second line of the LCD
+        lcd_e    : out STD_LOGIC;  -- LCD Enable pin
+        lcd_rs   : out STD_LOGIC;  -- LCD Register Select pin
+        lcd_rw   : out STD_LOGIC;  -- LCD Read/Write pin
+        lcd_db   : out STD_LOGIC_VECTOR(7 downto 0) -- LCD Data Bus
+    );
+end lcd_controller;
+
+architecture Behavioral of lcd_controller is
+    -- FSM for LCD control and initialization.
+    type T_LCD_STATE is (
+        S_RST, S_INIT_DELAY, 
+        S_INIT_CMD1_A, S_INIT_CMD1_B, S_INIT_CMD2_A, S_INIT_CMD2_B, 
+        S_INIT_CMD3_A, S_INIT_CMD3_B, S_INIT_CMD4_A, S_INIT_CMD4_B, 
+        S_INIT_DONE, S_ADDR1_A, S_ADDR1_B, S_WRITE_L1_A, S_WRITE_L1_B, 
+        S_ADDR2_A, S_ADDR2_B, S_WRITE_L2_A, S_WRITE_L2_B, S_WAIT
+    );
+    signal state : T_LCD_STATE := S_RST;
+    
+    -- Timer for generating delays required by the LCD protocol.
+    signal timer : integer range 0 to 1000000 := 0;
+    -- Pointer for iterating through characters in the line buffers.
+    signal char_ptr : integer range 0 to 15;
+    
+    -- Constants for calculating delays based on the system clock frequency.
+    constant CLK_FREQ_HZ: integer := 50_000_000; -- 50 MHz
+    constant DELAY_20MS:  integer := 20 * (CLK_FREQ_HZ / 1000);
+    constant DELAY_2MS:   integer := 2  * (CLK_FREQ_HZ / 1000);
+    constant DELAY_50US:  integer := 50 * (CLK_FREQ_HZ / 1_000_000);
+    constant DELAY_1US:   integer := 1  * (CLK_FREQ_HZ / 1_000_000);
+
+begin
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst = '1' then
+                state <= S_RST;
+            else
+                case state is
+                    when S_RST => 
+                        -- On reset, initialize variables and set control lines to safe state.
+                        state <= S_INIT_DELAY; timer <= 0; char_ptr <= 0; 
+                        lcd_e <= '0'; lcd_rs <= '0'; lcd_rw <= '0';
+                    
+                    -- LCD Initialization Sequence (based on HD44780 datasheet)
+                    when S_INIT_DELAY => -- Wait >15ms after power on.
+                        if timer < DELAY_20MS then timer <= timer + 1; else timer <= 0; state <= S_INIT_CMD1_A; end if;
+                    
+                    when S_INIT_CMD1_A => -- Command: Function Set (8-bit, 2-line, 5x8 dots)
+                        lcd_db <= X"38"; lcd_rs <= '0'; lcd_rw <= '0'; lcd_e <= '0'; 
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_INIT_CMD1_B; end if;
+                    when S_INIT_CMD1_B => -- Pulse Enable
+                        lcd_e <= '1'; 
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_INIT_CMD2_A; end if;
+                    
+                    when S_INIT_CMD2_A => -- Command: Display ON/OFF Control (Display on, Cursor off, Blink off)
+                        lcd_db <= X"0C"; lcd_rs <= '0'; lcd_rw <= '0'; lcd_e <= '0';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_INIT_CMD2_B; end if;
+                    when S_INIT_CMD2_B => -- Pulse Enable
+                        lcd_e <= '1';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_INIT_CMD3_A; end if;
+                        
+                    when S_INIT_CMD3_A => -- Command: Clear Display
+                        lcd_db <= X"01"; lcd_rs <= '0'; lcd_rw <= '0'; lcd_e <= '0';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_INIT_CMD3_B; end if;
+                    when S_INIT_CMD3_B => -- Pulse Enable and wait >1.52ms for clear to complete.
+                        lcd_e <= '1'; 
+                        if timer < DELAY_2MS then timer <= timer + 1; else timer <= 0; state <= S_INIT_CMD4_A; end if;
+                        
+                    when S_INIT_CMD4_A => -- Command: Entry Mode Set (Increment cursor, no display shift)
+                        lcd_db <= X"06"; lcd_rs <= '0'; lcd_rw <= '0'; lcd_e <= '0'; 
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_INIT_CMD4_B; end if;
+                    when S_INIT_CMD4_B => -- Pulse Enable
+                        lcd_e <= '1';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_INIT_DONE; end if;
+
+                    -- Main Display Loop
+                    when S_INIT_DONE => -- Wait a bit before starting the main loop.
+                        if timer < DELAY_50US then timer <= timer + 1; else timer <= 0; state <= S_ADDR1_A; end if;
+                        
+                    when S_ADDR1_A => -- Command: Set DDRAM address to line 1, position 0 (0x80).
+                        lcd_db <= X"80"; lcd_rs <= '0'; lcd_rw <= '0'; lcd_e <= '0';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_ADDR1_B; end if;
+                    when S_ADDR1_B => -- Pulse Enable
+                        lcd_e <= '1'; 
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; char_ptr <= 0; state <= S_WRITE_L1_A; end if;
+                    
+                    when S_WRITE_L1_A => -- Write one character to line 1.
+                        lcd_db <= line1_in(char_ptr); lcd_rs <= '1'; lcd_rw <= '0'; lcd_e <= '0';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_WRITE_L1_B; end if;
+                    when S_WRITE_L1_B => -- Pulse Enable
+                        lcd_e <= '1';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; 
+                            if char_ptr < 15 then -- Move to next character or next line.
+                                char_ptr <= char_ptr + 1; 
+                                state <= S_WRITE_L1_A; 
+                            else 
+                                state <= S_ADDR2_A; 
+                            end if; 
+                        end if;
+                        
+                    when S_ADDR2_A => -- Command: Set DDRAM address to line 2, position 0 (0xC0).
+                        lcd_db <= X"C0"; lcd_rs <= '0'; lcd_rw <= '0'; lcd_e <= '0';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_ADDR2_B; end if;
+                    when S_ADDR2_B => -- Pulse Enable
+                        lcd_e <= '1'; 
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; char_ptr <= 0; state <= S_WRITE_L2_A; end if;
+                    
+                    when S_WRITE_L2_A => -- Write one character to line 2.
+                        lcd_db <= line2_in(char_ptr); lcd_rs <= '1'; lcd_rw <= '0'; lcd_e <= '0';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; state <= S_WRITE_L2_B; end if;
+                    when S_WRITE_L2_B => -- Pulse Enable
+                        lcd_e <= '1';
+                        if timer < DELAY_1US then timer <= timer + 1; else timer <= 0; 
+                            if char_ptr < 15 then -- Move to next character or wait state.
+                                char_ptr <= char_ptr + 1; 
+                                state <= S_WRITE_L2_A; 
+                            else 
+                                state <= S_WAIT; 
+                            end if; 
+                        end if;
+                        
+                    when S_WAIT => -- Wait before restarting the refresh cycle.
+                        if timer < DELAY_2MS then timer <= timer + 1; else timer <= 0; state <= S_ADDR1_A; end if;
+                end case;
+            end if;
+        end if;
+    end process;
+end Behavioral;
+
+-- =============================================================================
+-- == FINAL MODULE: TOP LEVEL calculadora_top
+-- =============================================================================
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use work.lcd_pkg.all;
+
+-- This is the top-level entity that connects all the sub-modules together
+-- and maps them to the physical pins of the FPGA.
+entity calculadora_top is
+    Port (
+        CLK       : in  STD_LOGIC; -- System Clock
+        rst_btn   : in  STD_LOGIC; -- Asynchronous Reset Button
+        led_status: out STD_LOGIC_VECTOR(3 downto 0); -- Status LEDs
+        -- PS/2 Port
+        PS2_DATA1 : in  STD_LOGIC;
+        PS2_CLK1  : in  STD_LOGIC;
+        -- LCD Port
+        OE        : out STD_LOGIC; -- Mapped to LCD Enable (E)
+        RS        : out STD_LOGIC; -- LCD Register Select
+        RW        : out STD_LOGIC; -- LCD Read/Write
+        LCD_DB    : out STD_LOGIC_VECTOR (7 downto 0) -- LCD Data Bus
+    );
+end calculadora_top;
+
+architecture Behavioral of calculadora_top is
+    -- Component declarations for all sub-modules.
+    component reset_handler is Port (clk: in STD_LOGIC; async_rst: in STD_LOGIC; sync_rst: out STD_LOGIC); end component;
+    component ps2_keyboard is Port (clk: in STD_LOGIC; ps2_clk: in STD_LOGIC; ps2_data: in STD_LOGIC; ascii_out: out STD_LOGIC_VECTOR(7 downto 0); data_ready: out STD_LOGIC); end component;
+    component int_to_ascii_converter is Port (clk: in STD_LOGIC; rst: in STD_LOGIC; num_in: in integer range -9999 to 9999; start: in STD_LOGIC; ascii_d0: out STD_LOGIC_VECTOR(7 downto 0); ascii_d1: out STD_LOGIC_VECTOR(7 downto 0); ascii_d2: out STD_LOGIC_VECTOR(7 downto 0); ascii_d3: out STD_LOGIC_VECTOR(7 downto 0); done: out STD_LOGIC); end component;
+    component integer_divider is Port (clk: in STD_LOGIC; rst: in STD_LOGIC; start: in STD_LOGIC; dividend_in: in integer range 0 to 999999; divisor_in: in integer range 0 to 999999; quotient_out: out integer range 0 to 999999; done: out STD_LOGIC; div_by_zero: out STD_LOGIC); end component;
+    component calculator_logic is Port (clk: in STD_LOGIC; rst: in STD_LOGIC; ascii_in: in STD_LOGIC_VECTOR(7 downto 0); data_ready: in STD_LOGIC; conv_done: in STD_LOGIC; conv_d3: in STD_LOGIC_VECTOR(7 downto 0); conv_d2: in STD_LOGIC_VECTOR(7 downto 0); conv_d1: in STD_LOGIC_VECTOR(7 downto 0); conv_d0: in STD_LOGIC_VECTOR(7 downto 0); div_done: in STD_LOGIC; div_by_zero: in STD_LOGIC; div_quotient: in integer range 0 to 999999; conv_start: out STD_LOGIC; conv_num_in: out integer range -9999 to 9999; div_start: out STD_LOGIC; div_dividend: out integer range 0 to 999999; div_divisor: out integer range 0 to 999999; lcd_line1: out T_LCD_LINE; lcd_line2: out T_LCD_LINE; led_status: out STD_LOGIC_VECTOR(3 downto 0)); end component;
+    component lcd_controller is Port (clk: in STD_LOGIC; rst: in STD_LOGIC; line1_in: in T_LCD_LINE; line2_in: in T_LCD_LINE; lcd_e: out STD_LOGIC; lcd_rs: out STD_LOGIC; lcd_rw: out STD_LOGIC; lcd_db: out STD_LOGIC_VECTOR(7 downto 0)); end component;
+
+    -- Internal signals (wires) to connect the components.
+    signal s_sync_rst: STD_LOGIC;
+    signal s_ascii_code: STD_LOGIC_VECTOR(7 downto 0);
+    signal s_data_ready: STD_LOGIC;
+    signal s_lcd_line1, s_lcd_line2: T_LCD_LINE;
+    signal s_conv_start, s_conv_done: STD_LOGIC;
+    signal s_conv_num_in: integer range -9999 to 9999;
+    signal s_conv_d0, s_conv_d1, s_conv_d2, s_conv_d3: STD_LOGIC_VECTOR(7 downto 0);
+    signal s_div_start, s_div_done, s_div_by_zero: STD_LOGIC;
+    signal s_div_dividend, s_div_divisor, s_div_quotient: integer range 0 to 999999;
+    signal s_led_status_internal: STD_LOGIC_VECTOR(3 downto 0);
+begin
+    -- Connect internal status signal to the output port.
+    led_status <= s_led_status_internal;
+    
+    -- Instantiate the reset synchronizer.
+    u_rst_handler: reset_handler port map (clk=>CLK, async_rst=>rst_btn, sync_rst=>s_sync_rst);
+    
+    -- Instantiate the PS/2 keyboard controller.
+    u_ps2: ps2_keyboard port map (clk=>CLK, ps2_clk=>PS2_CLK1, ps2_data=>PS2_DATA1, ascii_out=>s_ascii_code, data_ready=>s_data_ready);
+    
+    -- Instantiate the integer-to-ASCII converter.
+    u_int_conv: int_to_ascii_converter port map (clk=>CLK, rst=>s_sync_rst, num_in=>s_conv_num_in, start=>s_conv_start, ascii_d0=>s_conv_d0, ascii_d1=>s_conv_d1, ascii_d2=>s_conv_d2, ascii_d3=>s_conv_d3, done=>s_conv_done);
+    
+    -- Instantiate the integer divider.
+    u_divider: integer_divider port map(clk=>CLK, rst=>s_sync_rst, start=>s_div_start, dividend_in=>s_div_dividend, divisor_in=>s_div_divisor, quotient_out=>s_div_quotient, done=>s_div_done, div_by_zero=>s_div_by_zero);
+    
+    -- Instantiate the main calculator logic controller.
+    u_calc: calculator_logic port map (
+        clk => CLK, rst => s_sync_rst,
+        ascii_in => s_ascii_code, data_ready => s_data_ready,
+        conv_done => s_conv_done, conv_d3 => s_conv_d3, conv_d2 => s_conv_d2,
+        conv_d1 => s_conv_d1, conv_d0 => s_conv_d0,
+        div_done => s_div_done, div_by_zero => s_div_by_zero,
+        div_quotient => s_div_quotient,
+        conv_start => s_conv_start, conv_num_in => s_conv_num_in,
+        div_start => s_div_start, div_dividend => s_div_dividend,
+        div_divisor => s_div_divisor,
+        lcd_line1 => s_lcd_line1, lcd_line2 => s_lcd_line2,
+        led_status => s_led_status_internal
+    );
+    
+    -- Instantiate the low-level LCD controller.
+    u_lcd: lcd_controller port map (clk=>CLK, rst=>s_sync_rst, line1_in=>s_lcd_line1, line2_in=>s_lcd_line2, lcd_e=>OE, lcd_rs=>RS, lcd_rw=>RW, lcd_db=>LCD_DB);
+    
+end Behavioral;
